@@ -4,6 +4,15 @@ import sys
 import cv2
 import numpy as np
 
+from candidates import GRID_REGION_SIZE, grid_candidates, grid_points
+
+# Number of grid sample points per click (and the upper bound on returned
+# candidates before de-duplication).
+TOP_N_CANDIDATES = 25
+
+CANDIDATE_BOX_COLOR = (0, 140, 255)
+GRID_POINT_COLOR = (255, 0, 255)
+
 # How far past the circle (in multiples of its radius) the warp fades out over,
 # so the boundary blends smoothly instead of cutting off sharply.
 FALLOFF_RATIO = 1.5
@@ -142,6 +151,16 @@ def main():
     mode_index = ZOOM_MODES.index("linear")
     paused = False
     raw_frame = None
+    last_candidates = []
+    last_grid_points = []
+
+    click_state = {"pos": None}
+
+    def on_mouse(event, mx, my, flags, userdata):
+        if event == cv2.EVENT_LBUTTONDOWN:
+            click_state["pos"] = (mx, my)
+
+    cv2.setMouseCallback(window, on_mouse)
 
     try:
         while True:
@@ -153,16 +172,18 @@ def main():
             frame = raw_frame.copy()
             mode = ZOOM_MODES[mode_index]
             zoom_value = max(100, cv2.getTrackbarPos("Zoom", window))
+            frame_size = (frame.shape[1], frame.shape[0])
+            display_maps = None
 
             if mode != "off" and zoom_value != 100:
                 zoom = zoom_value / 100.0
-                frame_size = (frame.shape[1], frame.shape[0])
                 if mode == "bulge":
                     if bulge_cache["zoom_value"] != zoom_value or bulge_cache["size"] != frame_size:
                         bulge_cache["maps"] = build_bulge_maps(frame_size[0], frame_size[1], zoom)
                         bulge_cache["zoom_value"] = zoom_value
                         bulge_cache["size"] = frame_size
                     map_x, map_y = bulge_cache["maps"]
+                    display_maps = (map_x, map_y)
                     frame = cv2.remap(frame, map_x, map_y, interpolation=cv2.INTER_LINEAR)
                 elif mode == "linear":
                     inner_ratio_value = cv2.getTrackbarPos("Inner Ratio", window)
@@ -179,6 +200,7 @@ def main():
                         rect_cache["inner_ratio_value"] = inner_ratio_value
                         rect_cache["size"] = frame_size
                     map_x, map_y = rect_cache["maps"]
+                    display_maps = (map_x, map_y)
                     frame = cv2.remap(frame, map_x, map_y, interpolation=cv2.INTER_LINEAR)
 
                     cx, cy = frame_size[0] / 2.0, frame_size[1] / 2.0
@@ -192,6 +214,20 @@ def main():
                         (0, 255, 255), 1,
                     )
                     frame = cv2.addWeighted(overlay, RECT_OVERLAY_ALPHA, frame, 1 - RECT_OVERLAY_ALPHA, 0)
+
+            # Candidate boxes were found in raw-frame coordinates; only draw
+            # them when the display isn't warped (display_maps is None), since
+            # warped coordinates would need a forward remap to place correctly.
+            if display_maps is None:
+                for candidate in last_candidates:
+                    cv2.rectangle(
+                        frame,
+                        (candidate["x1"], candidate["y1"]),
+                        (candidate["x2"], candidate["y2"]),
+                        CANDIDATE_BOX_COLOR, 2,
+                    )
+                for px, py in last_grid_points:
+                    cv2.circle(frame, (px, py), 3, GRID_POINT_COLOR, -1)
 
             cv2.putText(
                 frame, f"zoom: {mode}{' (paused)' if paused else ''}", (10, 25),
@@ -211,6 +247,32 @@ def main():
                 mode_index = (mode_index + 1) % len(ZOOM_MODES)
             if key == ord(" "):
                 paused = not paused
+
+            if click_state["pos"] is not None:
+                mx, my = click_state["pos"]
+                click_state["pos"] = None
+
+                if 0 <= mx < frame_size[0] and 0 <= my < frame_size[1]:
+                    if display_maps is not None:
+                        map_x, map_y = display_maps
+                        source_x = int(round(float(map_x[my, mx])))
+                        source_y = int(round(float(map_y[my, mx])))
+                    else:
+                        source_x, source_y = mx, my
+
+                    source_x = min(max(source_x, 0), frame_size[0] - 1)
+                    source_y = min(max(source_y, 0), frame_size[1] - 1)
+
+                    last_grid_points = grid_points(
+                        source_x, source_y, TOP_N_CANDIDATES, GRID_REGION_SIZE,
+                        frame_size[0], frame_size[1],
+                    )
+                    last_candidates = grid_candidates(
+                        source_x, source_y, raw_frame, n=TOP_N_CANDIDATES
+                    )
+                    print(f"Candidates around ({source_x}, {source_y}):")
+                    for i, candidate in enumerate(last_candidates):
+                        print(f"  {i + 1}. {candidate}")
     finally:
         cap.release()
         cv2.destroyAllWindows()

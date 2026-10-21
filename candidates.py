@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from typing import Union
 
 import cv2
@@ -241,6 +243,98 @@ def get_all_candidates(roi: np.ndarray, roi_size: int, around_center: dict[str, 
     return combine_boxes_and_scores(boxes, final_scores)
 
 
+def box_iou(box_a: dict[str, int], box_b: dict[str, int]) -> float:
+    """
+    Intersection-over-union of two candidate boxes.
+    """
+
+    ix1 = max(box_a["x1"], box_b["x1"])
+    iy1 = max(box_a["y1"], box_b["y1"])
+    ix2 = min(box_a["x2"], box_b["x2"])
+    iy2 = min(box_a["y2"], box_b["y2"])
+
+    inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
+    if inter == 0:
+        return 0.0
+
+    area_a = (box_a["x2"] - box_a["x1"]) * (box_a["y2"] - box_a["y1"])
+    area_b = (box_b["x2"] - box_b["x1"]) * (box_b["y2"] - box_b["y1"])
+    union = area_a + area_b - inter
+
+    return inter / union if union > 0 else 0.0
+
+
+# Candidates scoring below this are considered too weak to be useful and get
+# dropped, regardless of how they rank against the others.
+MIN_CANDIDATE_SCORE = 0.15
+
+
+def non_max_suppression(candidates: list[dict[str, Union[int, float]]], iou_threshold: float = 0.5) -> list[dict[str, Union[int, float]]]:
+    """
+    Greedily keep the highest-scoring candidates, dropping any later candidate
+    that overlaps an already-kept one past `iou_threshold`. The same ROI
+    searched at different sizes tends to rediscover the same object as
+    near-duplicate boxes, so this keeps the top-n genuinely distinct.
+    """
+
+    ordered = sorted(candidates, key=lambda c: c["score"], reverse=True)
+    kept: list[dict[str, Union[int, float]]] = []
+
+    for candidate in ordered:
+        if all(box_iou(candidate, k) < iou_threshold for k in kept):
+            kept.append(candidate)
+
+    return kept
+
+
+def _prepare_gray(frame: np.ndarray) -> np.ndarray:
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    return cv2.GaussianBlur(gray, (5, 5), 0)
+
+
+def _all_candidates_at_point(gray: np.ndarray, x: int, y: int) -> list[dict[str, Union[int, float]]]:
+    """
+    Pool every candidate found around (x, y) across all ROI sizes (no
+    de-duplication yet).
+    """
+
+    all_candidates = []
+    for size in range(20, 200, 10):
+        roi = crop_centered_roi(gray, x, y, size)
+        all_candidates.extend(get_all_candidates(roi, size, {"x": x, "y": y}))
+    return all_candidates
+
+
+def top_n_candidates(x: int, y: int, frame: np.ndarray, n: int = 5, iou_threshold: float = 0.5, min_score: float = MIN_CANDIDATE_SCORE) -> list[dict[str, Union[int, float]]]:
+    """
+    Find the top n candidates around the given point, pooling candidates
+    found across every ROI size and de-duplicating overlapping boxes.
+
+    Args:
+        x (int): center's x coordinate.
+        y (int): center's y coordinate.
+        frame (np.ndarray): full frame
+        n (int): how many candidates to return, highest score first.
+        iou_threshold (float): overlap above which a lower-scoring candidate
+            is treated as a duplicate of a kept one and dropped.
+        min_score (float): candidates scoring below this are dropped.
+
+    Returns:
+        list[dict]: Up to n candidate dictionaries, highest score first.
+        [{"x1": int, "y1": int, "x2": int, "y2": int, "score": float}]
+    """
+
+    gray = _prepare_gray(frame)
+    all_candidates = _all_candidates_at_point(gray, x, y)
+
+    if not all_candidates:
+        return []
+
+    deduped = non_max_suppression(all_candidates, iou_threshold)
+    filtered = [c for c in deduped if c["score"] >= min_score]
+    return filtered[:n]
+
+
 def best_candidate(x: int, y: int, frame: np.ndarray) -> dict[str, int]:
     """
     Find the best (with the highest combined score) candidate to the given coordinates.
@@ -255,34 +349,72 @@ def best_candidate(x: int, y: int, frame: np.ndarray) -> dict[str, int]:
         {"x1": int, "y1": int, "x2": int, "y2": int}
     """
 
-    best_score = -1
-    best_box = {
-        "x1": -1,
-        "y1": -1,
-        "x2": -1,
-        "y2": -1
-    }
+    top = top_n_candidates(x, y, frame, n=1)
+    if not top:
+        return {"x1": -1, "y1": -1, "x2": -1, "y2": -1}
 
-    # grayscale + blur the frame ONCE
-    frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    frame = cv2.GaussianBlur(frame, (5, 5), 0)
+    return {"x1": top[0]["x1"], "y1": top[0]["y1"], "x2": top[0]["x2"], "y2": top[0]["y2"]}
 
-    # go through every size for roi to avoid thresholding the score
-    for size in range(20, 200, 10):
-        
-        # crop the region of interest        
-        roi = crop_centered_roi(frame, x, y, size)
 
-        # get all candidates from that region
-        candidates = get_all_candidates(roi, size, {"x": x, "y": y})
+# Fixed side length (in pixels) of the square sampled around a clicked point.
+GRID_REGION_SIZE = 100
 
-        if not candidates:
-            continue
 
-        top = max(candidates, key=lambda c: c["score"])
-        if top["score"] > best_score:
-            best_score = top["score"]
-            best_box = {"x1": top["x1"], "y1": top["y1"], "x2": top["x2"],
-                        "y2": top["y2"]}
-    
-    return best_box
+def grid_points(x: int, y: int, n: int, region_size: int, width: int, height: int) -> list[tuple[int, int]]:
+    """
+    n points laid out on an even grid covering a `region_size` x `region_size`
+    square centered on (x, y), clamped into the frame bounds. If n isn't a
+    perfect square, the grid is sized to just cover it (cols * rows >= n)
+    and trimmed down to exactly n points.
+    """
+
+    half = region_size / 2.0
+    cols = max(1, int(round(np.sqrt(n))))
+    rows = int(np.ceil(n / cols))
+
+    xs = np.linspace(x - half, x + half, cols)
+    ys = np.linspace(y - half, y + half, rows)
+
+    points = [(int(round(px)), int(round(py))) for py in ys for px in xs][:n]
+
+    return [
+        (min(max(px, 0), width - 1), min(max(py, 0), height - 1))
+        for px, py in points
+    ]
+
+
+def grid_candidates(x: int, y: int, frame: np.ndarray, n: int, region_size: int = GRID_REGION_SIZE, iou_threshold: float = 0.5, min_score: float = MIN_CANDIDATE_SCORE) -> list[dict[str, Union[int, float]]]:
+    """
+    Sample n points on an even grid covering a `region_size` x `region_size`
+    square centered on (x, y), run the single-point best-candidate search
+    (same logic as `best_candidate`) at each sampled point, and return the
+    de-duplicated results.
+
+    Args:
+        x (int): click's x coordinate.
+        y (int): click's y coordinate.
+        frame (np.ndarray): full frame.
+        n (int): number of grid sample points (and the upper bound on how
+            many candidates come back, before de-duplication).
+        region_size (int): side length (pixels) of the square sampled around
+            (x, y).
+        iou_threshold (float): overlap above which a lower-scoring candidate
+            is treated as a duplicate of a kept one and dropped.
+        min_score (float): candidates scoring below this are dropped.
+
+    Returns:
+        list[dict]: Up to n candidate dictionaries, highest score first.
+        [{"x1": int, "y1": int, "x2": int, "y2": int, "score": float}]
+    """
+
+    gray = _prepare_gray(frame)
+    height, width = gray.shape[:2]
+
+    results = []
+    for px, py in grid_points(x, y, n, region_size, width, height):
+        candidates = _all_candidates_at_point(gray, px, py)
+        if candidates:
+            results.append(max(candidates, key=lambda c: c["score"]))
+
+    deduped = non_max_suppression(results, iou_threshold)
+    return [c for c in deduped if c["score"] >= min_score]

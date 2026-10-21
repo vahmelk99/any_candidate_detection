@@ -268,6 +268,10 @@ def box_iou(box_a: dict[str, int], box_b: dict[str, int]) -> float:
 # dropped, regardless of how they rank against the others.
 MIN_CANDIDATE_SCORE = 0.15
 
+# When a smaller box overlaps a bigger one past this IoU, it's treated as the
+# same object found at a smaller scale, not a distinct candidate.
+CONTAINMENT_IOU_THRESHOLD = 0.8
+
 
 def non_max_suppression(candidates: list[dict[str, Union[int, float]]], iou_threshold: float = 0.5) -> list[dict[str, Union[int, float]]]:
     """
@@ -278,6 +282,28 @@ def non_max_suppression(candidates: list[dict[str, Union[int, float]]], iou_thre
     """
 
     ordered = sorted(candidates, key=lambda c: c["score"], reverse=True)
+    kept: list[dict[str, Union[int, float]]] = []
+
+    for candidate in ordered:
+        if all(box_iou(candidate, k) < iou_threshold for k in kept):
+            kept.append(candidate)
+
+    return kept
+
+
+def box_area(box: dict[str, int]) -> int:
+    return max(0, box["x2"] - box["x1"]) * max(0, box["y2"] - box["y1"])
+
+
+def remove_contained_boxes(candidates: list[dict[str, Union[int, float]]], iou_threshold: float = CONTAINMENT_IOU_THRESHOLD) -> list[dict[str, Union[int, float]]]:
+    """
+    When a smaller box overlaps a bigger one past `iou_threshold`, drop the
+    smaller one and keep only the bigger box, regardless of their scores.
+    Unlike `non_max_suppression` (which keeps the higher-scoring box of an
+    overlapping pair), this always prefers size.
+    """
+
+    ordered = sorted(candidates, key=box_area, reverse=True)
     kept: list[dict[str, Union[int, float]]] = []
 
     for candidate in ordered:
@@ -299,7 +325,7 @@ def _all_candidates_at_point(gray: np.ndarray, x: int, y: int) -> list[dict[str,
     """
 
     all_candidates = []
-    for size in range(20, 200, 10):
+    for size in range(20, 100, 10):
         roi = crop_centered_roi(gray, x, y, size)
         all_candidates.extend(get_all_candidates(roi, size, {"x": x, "y": y}))
     return all_candidates
@@ -331,6 +357,7 @@ def top_n_candidates(x: int, y: int, frame: np.ndarray, n: int = 5, iou_threshol
         return []
 
     deduped = non_max_suppression(all_candidates, iou_threshold)
+    deduped = remove_contained_boxes(deduped)
     filtered = [c for c in deduped if c["score"] >= min_score]
     return filtered[:n]
 
@@ -359,6 +386,9 @@ def best_candidate(x: int, y: int, frame: np.ndarray) -> dict[str, int]:
 # Fixed side length (in pixels) of the square sampled around a clicked point.
 GRID_REGION_SIZE = 100
 
+# How many candidates grid_candidates returns at most, highest score first.
+MAX_RESULTS = 10
+
 
 def grid_points(x: int, y: int, n: int, region_size: int, width: int, height: int) -> list[tuple[int, int]]:
     """
@@ -383,28 +413,29 @@ def grid_points(x: int, y: int, n: int, region_size: int, width: int, height: in
     ]
 
 
-def grid_candidates(x: int, y: int, frame: np.ndarray, n: int, region_size: int = GRID_REGION_SIZE, iou_threshold: float = 0.5, min_score: float = MIN_CANDIDATE_SCORE) -> list[dict[str, Union[int, float]]]:
+def grid_candidates(x: int, y: int, frame: np.ndarray, n: int, region_size: int = GRID_REGION_SIZE, iou_threshold: float = 0.5, min_score: float = MIN_CANDIDATE_SCORE, max_results: int = MAX_RESULTS) -> list[dict[str, Union[int, float]]]:
     """
     Sample n points on an even grid covering a `region_size` x `region_size`
     square centered on (x, y), run the single-point best-candidate search
     (same logic as `best_candidate`) at each sampled point, and return the
-    de-duplicated results.
+    de-duplicated, score-filtered results.
 
     Args:
         x (int): click's x coordinate.
         y (int): click's y coordinate.
         frame (np.ndarray): full frame.
-        n (int): number of grid sample points (and the upper bound on how
-            many candidates come back, before de-duplication).
+        n (int): number of grid sample points searched.
         region_size (int): side length (pixels) of the square sampled around
             (x, y).
         iou_threshold (float): overlap above which a lower-scoring candidate
             is treated as a duplicate of a kept one and dropped.
         min_score (float): candidates scoring below this are dropped.
+        max_results (int): at most this many candidates are returned,
+            highest score first.
 
     Returns:
-        list[dict]: Up to n candidate dictionaries, highest score first.
-        [{"x1": int, "y1": int, "x2": int, "y2": int, "score": float}]
+        list[dict]: Up to max_results candidate dictionaries, highest score
+        first. [{"x1": int, "y1": int, "x2": int, "y2": int, "score": float}]
     """
 
     gray = _prepare_gray(frame)
@@ -417,4 +448,6 @@ def grid_candidates(x: int, y: int, frame: np.ndarray, n: int, region_size: int 
             results.append(max(candidates, key=lambda c: c["score"]))
 
     deduped = non_max_suppression(results, iou_threshold)
-    return [c for c in deduped if c["score"] >= min_score]
+    deduped = remove_contained_boxes(deduped)
+    filtered = [c for c in deduped if c["score"] >= min_score]
+    return filtered[:max_results]

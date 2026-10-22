@@ -4,7 +4,11 @@ import sys
 import cv2
 import numpy as np
 
-from candidates import GRID_REGION_SIZE, grid_candidates, grid_points
+from candidates import (
+    CLICK_DISTANCE_WEIGHT, GRID_REGION_SIZE, MAX_COLOR_VARIATION, MIN_COLOR_VARIATION,
+    POINT_REACH,
+    grid_candidates, grid_points,
+)
 
 # Number of grid sample points per click (and the upper bound on returned
 # candidates before de-duplication).
@@ -146,6 +150,27 @@ def main():
         "Inner Ratio", window, int(RECT_ZOOM_INNER_RATIO * 100), 100, lambda _pos: None
     )
 
+    # Color-variation cut-off sliders (Lab units, plain ints). Boxes outside
+    # [min, max] are dropped; max at its slider ceiling means "no upper cut".
+    color_var_slider_max = 100
+    cv2.createTrackbar(
+        "Color Var Min", window, int(MIN_COLOR_VARIATION or 0), color_var_slider_max, lambda _pos: None
+    )
+    cv2.createTrackbar(
+        "Color Var Max (top=off)", window,
+        int(MAX_COLOR_VARIATION or color_var_slider_max), color_var_slider_max, lambda _pos: None,
+    )
+
+    # Click-distance weight slider (value / 100): how strongly candidates far
+    # from the clicked point are penalized. 0 = ignore distance.
+    cv2.createTrackbar(
+        "Click Dist Weight", window, int(CLICK_DISTANCE_WEIGHT * 100), 100, lambda _pos: None
+    )
+
+    # Point-reach slider (px): how far from a grid point a box may be and
+    # still be accepted by it. Above the grid spacing, neighbors overlap.
+    cv2.createTrackbar("Point Reach", window, int(POINT_REACH), 100, lambda _pos: None)
+
     bulge_cache = {"zoom_value": None, "size": None, "maps": None}
     rect_cache = {"zoom_value": None, "inner_ratio_value": None, "size": None, "maps": None}
     mode_index = ZOOM_MODES.index("linear")
@@ -155,6 +180,8 @@ def main():
     last_grid_points = []
 
     click_state = {"pos": None}
+    last_click_pos = None
+    last_color_range = None
 
     def on_mouse(event, mx, my, flags, userdata):
         if event == cv2.EVENT_MOUSEMOVE:
@@ -250,9 +277,23 @@ def main():
             if key == ord(" "):
                 paused = not paused
 
+            min_var = cv2.getTrackbarPos("Color Var Min", window)
+            max_var = cv2.getTrackbarPos("Color Var Max (top=off)", window)
+            if max_var >= color_var_slider_max:
+                max_var = None
+            # Moving a slider re-runs the last search so the effect is visible
+            # right away.
+            dist_weight = cv2.getTrackbarPos("Click Dist Weight", window) / 100.0
+            point_reach = cv2.getTrackbarPos("Point Reach", window)
+            if (min_var, max_var, dist_weight, point_reach) != last_color_range:
+                last_color_range = (min_var, max_var, dist_weight, point_reach)
+                if last_click_pos is not None and click_state["pos"] is None:
+                    click_state["pos"] = last_click_pos
+
             if click_state["pos"] is not None:
                 mx, my = click_state["pos"]
                 click_state["pos"] = None
+                last_click_pos = (mx, my)
 
                 if 0 <= mx < frame_size[0] and 0 <= my < frame_size[1]:
                     # Extract straight from the frame as currently zoomed/warped
@@ -263,11 +304,13 @@ def main():
                         frame_size[0], frame_size[1],
                     )
                     last_candidates = grid_candidates(
-                        mx, my, candidate_frame, n=TOP_N_CANDIDATES
+                        mx, my, candidate_frame, n=TOP_N_CANDIDATES,
+                        min_color_variation=min_var, max_color_variation=max_var,
+                        click_distance_weight=dist_weight, point_reach=point_reach,
                     )
-                    print(f"Candidates around ({mx}, {my}):")
-                    for i, candidate in enumerate(last_candidates):
-                        print(f"  {i + 1}. {candidate}")
+                    # print(f"Candidates around ({mx}, {my}):")
+                    # for i, candidate in enumerate(last_candidates):
+                    #     print(f"  {i + 1}. {candidate}")
     finally:
         cap.release()
         cv2.destroyAllWindows()

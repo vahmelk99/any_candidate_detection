@@ -322,8 +322,8 @@ def remove_contained_boxes(candidates: list[dict[str, Union[int, float]]], iou_t
 # [MIN, MAX] are dropped: below MIN is a near-flat patch (sky, water, ground),
 # above MAX is busy texture (grass, waves, clutter). Lab units, 0 = perfectly
 # flat color. Tune on real footage; None disables that side.
-MIN_COLOR_VARIATION = 8.0
-MAX_COLOR_VARIATION = None
+MIN_COLOR_VARIATION = 10
+MAX_COLOR_VARIATION = 75
 
 # Fraction of the box trimmed from each side before measuring color, so the
 # background caught in the box corners doesn't count as variation.
@@ -471,18 +471,61 @@ GRID_REGION_SIZE = 200
 # How far (px) from a grid point a box may lie and still be accepted by that
 # point. Bigger than the grid spacing (region / (cols - 1), ~33 px for 49 points
 # over 200 px) means neighboring points' reach overlaps, so no gap is missed.
-POINT_REACH = 30
+POINT_REACH = 100
 
 # How many candidates grid_candidates returns at most, highest score first.
 MAX_RESULTS = 10
 
 
-def grid_points(x: int, y: int, n: int, region_size: int, width: int, height: int) -> list[tuple[int, int]]:
+# 0 = evenly spaced grid, 1 = points spread purely by local color change.
+ADAPTIVE_STRENGTH = 1
+
+
+def _adaptive_points(frame: np.ndarray, n: int, x: int, y: int, x0: int, y0: int, x1: int, y1: int, strength: float, step: int = 4) -> list[tuple[int, int]]:
+    """
+    Pick n points inside [x0, x1) x [y0, y1) that crowd where the color
+    changes a lot and thin out where it is flat. Each pixel is weighted by its
+    Lab gradient magnitude (relative to the region's mean), blended with a
+    uniform weight by `strength`; points are then chosen greedily, each one
+    where (sqrt(weight) * distance to the nearest point already chosen) is
+    largest, so spacing shrinks as the weight grows. Starts at the pixel
+    nearest the click (x, y) and is fully deterministic.
+    """
+
+    patch = cv2.GaussianBlur(frame[y0:y1, x0:x1], (5, 5), 0)
+    lab = cv2.cvtColor(patch, cv2.COLOR_BGR2LAB).astype(np.float32)
+    gx = cv2.Sobel(lab, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(lab, cv2.CV_32F, 0, 1, ksize=3)
+    change = np.sqrt((gx ** 2 + gy ** 2).sum(axis=2))[::step, ::step]
+
+    # floor so flat areas keep some points; cap so one edge can't hog them all
+    change = np.clip(change / max(float(change.mean()), 1e-6), 0.1, 5.0)
+    weights = np.sqrt((1.0 - strength) + strength * change).ravel()
+
+    ys, xs = np.mgrid[0:change.shape[0], 0:change.shape[1]]
+    pixels = np.stack([x0 + xs.ravel() * step, y0 + ys.ravel() * step], axis=1).astype(np.float32)
+
+    first = int(((pixels - np.array([x, y], dtype=np.float32)) ** 2).sum(axis=1).argmin())
+    chosen = [first]
+    nearest = np.sqrt(((pixels - pixels[first]) ** 2).sum(axis=1))
+    for _ in range(min(n, len(pixels)) - 1):
+        nxt = int((weights * nearest).argmax())
+        chosen.append(nxt)
+        nearest = np.minimum(nearest, np.sqrt(((pixels - pixels[nxt]) ** 2).sum(axis=1)))
+
+    return [(int(pixels[i, 0]), int(pixels[i, 1])) for i in chosen]
+
+
+def grid_points(x: int, y: int, n: int, region_size: int, width: int, height: int, frame: np.ndarray | None = None, adaptive_strength: float = ADAPTIVE_STRENGTH) -> list[tuple[int, int]]:
     """
     n points laid out on an even grid covering a `region_size` x `region_size`
     square centered on (x, y), clamped into the frame bounds. If n isn't a
     perfect square, the grid is sized to just cover it (cols * rows >= n)
     and trimmed down to exactly n points.
+
+    With a `frame` and `adaptive_strength` > 0 the points are then shifted
+    toward areas of strong color change (see `_adaptive_points`), so a
+    monotone area gets fewer points and a busy one more.
     """
 
     half = region_size / 2.0
@@ -494,13 +537,24 @@ def grid_points(x: int, y: int, n: int, region_size: int, width: int, height: in
 
     points = [(int(round(px)), int(round(py))) for py in ys for px in xs][:n]
 
-    return [
+    points = [
         (min(max(px, 0), width - 1), min(max(py, 0), height - 1))
         for px, py in points
     ]
 
+    if frame is None or adaptive_strength <= 0:
+        return points
 
-def grid_candidates(x: int, y: int, frame: np.ndarray, n: int, region_size: int = GRID_REGION_SIZE, iou_threshold: float = 0.5, min_score: float = MIN_CANDIDATE_SCORE, max_results: int = MAX_RESULTS, roi_sizes: Sequence[int] = DEFAULT_ROI_SIZES, min_color_variation: float | None = MIN_COLOR_VARIATION, max_color_variation: float | None = MAX_COLOR_VARIATION, click_distance_weight: float = CLICK_DISTANCE_WEIGHT, point_reach: float = POINT_REACH) -> list[dict[str, Union[int, float]]]:
+    # the part of the region that lies inside the frame
+    x0, y0 = max(int(x - half), 0), max(int(y - half), 0)
+    x1, y1 = min(int(x + half) + 1, width), min(int(y + half) + 1, height)
+    if x1 - x0 < 8 or y1 - y0 < 8:
+        return points
+
+    return _adaptive_points(frame, n, x, y, x0, y0, x1, y1, adaptive_strength)
+
+
+def grid_candidates(x: int, y: int, frame: np.ndarray, n: int, region_size: int = GRID_REGION_SIZE, iou_threshold: float = 0.5, min_score: float = MIN_CANDIDATE_SCORE, max_results: int = MAX_RESULTS, roi_sizes: Sequence[int] = DEFAULT_ROI_SIZES, min_color_variation: float | None = MIN_COLOR_VARIATION, max_color_variation: float | None = MAX_COLOR_VARIATION, click_distance_weight: float = CLICK_DISTANCE_WEIGHT, point_reach: float = POINT_REACH, adaptive_strength: float = ADAPTIVE_STRENGTH) -> list[dict[str, Union[int, float]]]:
     """
     Sample n points on an even grid covering a `region_size` x `region_size`
     square centered on (x, y), run the single-point best-candidate search
@@ -530,6 +584,8 @@ def grid_candidates(x: int, y: int, frame: np.ndarray, n: int, region_size: int 
         point_reach (float): a grid point also accepts boxes within this many
             pixels of it, not only boxes containing it. Set above the grid
             spacing so small objects between points are still found.
+        adaptive_strength (float): 0 spaces the points evenly; towards 1 they
+            crowd where the color changes and thin out over flat areas.
 
     Returns:
         list[dict]: Up to max_results candidate dictionaries, highest score
@@ -543,7 +599,7 @@ def grid_candidates(x: int, y: int, frame: np.ndarray, n: int, region_size: int 
     max_dist = region_size * np.sqrt(2) / 2
 
     results = []
-    for px, py in grid_points(x, y, n, region_size, width, height):
+    for px, py in grid_points(x, y, n, region_size, width, height, frame, adaptive_strength):
         candidates = filter_by_color_variation(frame, _all_candidates_at_point(gray, px, py, roi_sizes, point_reach), min_color_variation, max_color_variation)
         penalize_click_distance(candidates, x, y, max_dist, click_distance_weight)
         if candidates:

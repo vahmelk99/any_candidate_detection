@@ -6,13 +6,13 @@ import numpy as np
 
 from candidates import (
     CLICK_DISTANCE_WEIGHT, GRID_REGION_SIZE, MAX_COLOR_VARIATION, MIN_COLOR_VARIATION,
-    POINT_REACH,
+    ADAPTIVE_STRENGTH, POINT_REACH,
     grid_candidates, grid_points,
 )
 
 # Number of grid sample points per click (and the upper bound on returned
 # candidates before de-duplication).
-TOP_N_CANDIDATES = 49
+TOP_N_CANDIDATES = 25
 
 CANDIDATE_BOX_COLOR = (0, 140, 255)
 GRID_POINT_COLOR = (255, 0, 255)
@@ -171,6 +171,12 @@ def main():
     # still be accepted by it. Above the grid spacing, neighbors overlap.
     cv2.createTrackbar("Point Reach", window, int(POINT_REACH), 100, lambda _pos: None)
 
+    # Adaptive-points slider (value / 100): 0 = even grid, 100 = points follow
+    # local color change (more where busy, fewer where flat).
+    cv2.createTrackbar(
+        "Adaptive Points", window, int(ADAPTIVE_STRENGTH * 100), 100, lambda _pos: None
+    )
+
     bulge_cache = {"zoom_value": None, "size": None, "maps": None}
     rect_cache = {"zoom_value": None, "inner_ratio_value": None, "size": None, "maps": None}
     mode_index = ZOOM_MODES.index("linear")
@@ -285,8 +291,9 @@ def main():
             # right away.
             dist_weight = cv2.getTrackbarPos("Click Dist Weight", window) / 100.0
             point_reach = cv2.getTrackbarPos("Point Reach", window)
-            if (min_var, max_var, dist_weight, point_reach) != last_color_range:
-                last_color_range = (min_var, max_var, dist_weight, point_reach)
+            adaptive = cv2.getTrackbarPos("Adaptive Points", window) / 100.0
+            if (min_var, max_var, dist_weight, point_reach, adaptive) != last_color_range:
+                last_color_range = (min_var, max_var, dist_weight, point_reach, adaptive)
                 if last_click_pos is not None and click_state["pos"] is None:
                     click_state["pos"] = last_click_pos
 
@@ -301,12 +308,13 @@ def main():
                     # exactly what's on screen.
                     last_grid_points = grid_points(
                         mx, my, TOP_N_CANDIDATES, GRID_REGION_SIZE,
-                        frame_size[0], frame_size[1],
+                        frame_size[0], frame_size[1], candidate_frame, adaptive,
                     )
                     last_candidates = grid_candidates(
                         mx, my, candidate_frame, n=TOP_N_CANDIDATES,
                         min_color_variation=min_var, max_color_variation=max_var,
                         click_distance_weight=dist_weight, point_reach=point_reach,
+                        adaptive_strength=adaptive,
                     )
                     # print(f"Candidates around ({mx}, {my}):")
                     # for i, candidate in enumerate(last_candidates):

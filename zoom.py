@@ -14,8 +14,71 @@ from candidates import (
 # candidates before de-duplication).
 TOP_N_CANDIDATES = 25
 
-CANDIDATE_BOX_COLOR = (0, 140, 255)
 GRID_POINT_COLOR = (255, 0, 255)
+
+# Distinct colors cycled through for each candidate's box border; the same
+# color is used for its thumbnail border in the preview strip.
+CANDIDATE_COLORS = [
+    (0, 140, 255), (255, 0, 255), (0, 255, 255), (255, 191, 0), (0, 255, 0),
+    (255, 60, 60), (200, 0, 255), (0, 215, 255), (255, 140, 0), (120, 255, 0),
+]
+
+
+def candidate_color(index):
+    return CANDIDATE_COLORS[index % len(CANDIDATE_COLORS)]
+
+
+# Thumbnail preview strip (shown at the top of the video for the current
+# candidates), each box scaled up to a square and placed side by side.
+THUMBNAIL_MAX_SIZE = 100
+THUMBNAIL_MIN_SIZE = 32
+THUMBNAIL_GAP = 6
+THUMBNAIL_BORDER = 4
+
+
+def build_thumbnail_strip(source_frame, candidates, frame_width):
+    """Crop each candidate's box out of source_frame, scale it up to a
+    square, and lay the squares side by side with a border colored to match
+    that candidate's box outline.
+    """
+
+    if not candidates:
+        return None
+
+    n = len(candidates)
+    budget = max(THUMBNAIL_MIN_SIZE, (frame_width - THUMBNAIL_GAP * (n + 1)) // n)
+    size = int(min(THUMBNAIL_MAX_SIZE, budget))
+    if size < THUMBNAIL_MIN_SIZE:
+        return None
+
+    tiles = []
+    for i, candidate in enumerate(candidates):
+        x1, y1, x2, y2 = candidate["x1"], candidate["y1"], candidate["x2"], candidate["y2"]
+        region = source_frame[max(0, y1):y2, max(0, x1):x2]
+        if region.size == 0:
+            continue
+
+        square = cv2.resize(region, (size, size), interpolation=cv2.INTER_LINEAR)
+        tile = cv2.copyMakeBorder(
+            square, THUMBNAIL_BORDER, THUMBNAIL_BORDER, THUMBNAIL_BORDER, THUMBNAIL_BORDER,
+            cv2.BORDER_CONSTANT, value=candidate_color(i),
+        )
+        tiles.append(tile)
+
+    if not tiles:
+        return None
+
+    gap_col = np.zeros((tiles[0].shape[0], THUMBNAIL_GAP, 3), dtype=np.uint8)
+    pieces = [gap_col]
+    for tile in tiles:
+        pieces.append(tile)
+        pieces.append(gap_col)
+    strip = np.hstack(pieces)
+
+    if strip.shape[1] > frame_width:
+        strip = strip[:, :frame_width]
+
+    return strip
 
 # How far past the circle (in multiples of its radius) the warp fades out over,
 # so the boundary blends smoothly instead of cutting off sharply.
@@ -187,13 +250,12 @@ def main():
     raw_frame = None
     last_candidates = []
     last_grid_points = []
+    last_thumbnail_strip = None
 
     click_state = {"pos": None}
-    last_click_pos = None
-    last_color_range = None
 
     def on_mouse(event, mx, my, flags, userdata):
-        if event == cv2.EVENT_MOUSEMOVE:
+        if event == cv2.EVENT_LBUTTONDOWN:
             click_state["pos"] = (mx, my)
 
     cv2.setMouseCallback(window, on_mouse)
@@ -257,18 +319,24 @@ def main():
             if candidate_frame is None:
                 candidate_frame = frame.copy()
 
-            for candidate in last_candidates:
+            for i, candidate in enumerate(last_candidates):
                 cv2.rectangle(
                     frame,
                     (candidate["x1"], candidate["y1"]),
                     (candidate["x2"], candidate["y2"]),
-                    CANDIDATE_BOX_COLOR, 2,
+                    candidate_color(i), 2,
                 )
             for px, py in last_grid_points:
                 cv2.circle(frame, (px, py), 3, GRID_POINT_COLOR, -1)
 
+            text_y = 25
+            if last_thumbnail_strip is not None:
+                strip_h, strip_w = last_thumbnail_strip.shape[:2]
+                frame[0:strip_h, 0:strip_w] = last_thumbnail_strip
+                text_y = strip_h + 20
+
             cv2.putText(
-                frame, f"zoom: {mode}{' (paused)' if paused else ''}", (10, 25),
+                frame, f"zoom: {mode}{' (paused)' if paused else ''}", (10, text_y),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2, cv2.LINE_AA,
             )
 
@@ -290,20 +358,13 @@ def main():
             max_var = cv2.getTrackbarPos("Color Var Max (top=off)", controls_window)
             if max_var >= color_var_slider_max:
                 max_var = None
-            # Moving a slider re-runs the last search so the effect is visible
-            # right away.
             dist_weight = cv2.getTrackbarPos("Click Dist Weight", controls_window) / 100.0
             point_reach = cv2.getTrackbarPos("Point Reach", controls_window)
             adaptive = cv2.getTrackbarPos("Adaptive Points", controls_window) / 100.0
-            if (min_var, max_var, dist_weight, point_reach, adaptive) != last_color_range:
-                last_color_range = (min_var, max_var, dist_weight, point_reach, adaptive)
-                if last_click_pos is not None and click_state["pos"] is None:
-                    click_state["pos"] = last_click_pos
 
             if click_state["pos"] is not None:
                 mx, my = click_state["pos"]
                 click_state["pos"] = None
-                last_click_pos = (mx, my)
 
                 if 0 <= mx < frame_size[0] and 0 <= my < frame_size[1]:
                     # Extract straight from the frame as currently zoomed/warped
@@ -318,6 +379,12 @@ def main():
                         min_color_variation=min_var, max_color_variation=max_var,
                         click_distance_weight=dist_weight, point_reach=point_reach,
                         adaptive_strength=adaptive,
+                    )
+                    # Snapshot the thumbnails now, from the frame as it looked
+                    # at click time, so they stay fixed while the video plays
+                    # on and don't get re-cropped from a later, different frame.
+                    last_thumbnail_strip = build_thumbnail_strip(
+                        candidate_frame, last_candidates, frame_size[0]
                     )
                     # print(f"Candidates around ({mx}, {my}):")
                     # for i, candidate in enumerate(last_candidates):

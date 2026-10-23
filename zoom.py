@@ -126,6 +126,9 @@ def main():
     window = "soft_zoom"
     cv2.namedWindow(window, cv2.WINDOW_NORMAL)
 
+    controls_window = "controls"
+    cv2.namedWindow(controls_window, cv2.WINDOW_NORMAL)
+
     frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     seekable = frame_count > 0
     last_synced_pos = [-1]
@@ -137,44 +140,44 @@ def main():
             cap.set(cv2.CAP_PROP_POS_FRAMES, pos)
 
     if seekable:
-        cv2.createTrackbar("Position", window, 0, frame_count - 1, on_seek)
+        cv2.createTrackbar("Position", controls_window, 0, frame_count - 1, on_seek)
 
     # "Zoom" trackbar value is zoom * 100 so the slider can use plain ints;
     # 100 == 1.0x (no effect).
     zoom_slider_max = 500
-    cv2.createTrackbar("Zoom", window, 100, zoom_slider_max, lambda _pos: None)
+    cv2.createTrackbar("Zoom", controls_window, 100, zoom_slider_max, lambda _pos: None)
 
     # "Inner Ratio" trackbar value is the ratio * 100 (plain ints); only used
     # by the "linear" mode.
     cv2.createTrackbar(
-        "Inner Ratio", window, int(RECT_ZOOM_INNER_RATIO * 100), 100, lambda _pos: None
+        "Inner Ratio", controls_window, int(RECT_ZOOM_INNER_RATIO * 100), 100, lambda _pos: None
     )
 
     # Color-variation cut-off sliders (Lab units, plain ints). Boxes outside
     # [min, max] are dropped; max at its slider ceiling means "no upper cut".
     color_var_slider_max = 100
     cv2.createTrackbar(
-        "Color Var Min", window, int(MIN_COLOR_VARIATION or 0), color_var_slider_max, lambda _pos: None
+        "Color Var Min", controls_window, int(MIN_COLOR_VARIATION or 0), color_var_slider_max, lambda _pos: None
     )
     cv2.createTrackbar(
-        "Color Var Max (top=off)", window,
+        "Color Var Max (top=off)", controls_window,
         int(MAX_COLOR_VARIATION or color_var_slider_max), color_var_slider_max, lambda _pos: None,
     )
 
     # Click-distance weight slider (value / 100): how strongly candidates far
     # from the clicked point are penalized. 0 = ignore distance.
     cv2.createTrackbar(
-        "Click Dist Weight", window, int(CLICK_DISTANCE_WEIGHT * 100), 100, lambda _pos: None
+        "Click Dist Weight", controls_window, int(CLICK_DISTANCE_WEIGHT * 100), 100, lambda _pos: None
     )
 
     # Point-reach slider (px): how far from a grid point a box may be and
     # still be accepted by it. Above the grid spacing, neighbors overlap.
-    cv2.createTrackbar("Point Reach", window, int(POINT_REACH), 100, lambda _pos: None)
+    cv2.createTrackbar("Point Reach", controls_window, int(POINT_REACH), 100, lambda _pos: None)
 
     # Adaptive-points slider (value / 100): 0 = even grid, 100 = points follow
     # local color change (more where busy, fewer where flat).
     cv2.createTrackbar(
-        "Adaptive Points", window, int(ADAPTIVE_STRENGTH * 100), 100, lambda _pos: None
+        "Adaptive Points", controls_window, int(ADAPTIVE_STRENGTH * 100), 100, lambda _pos: None
     )
 
     bulge_cache = {"zoom_value": None, "size": None, "maps": None}
@@ -204,7 +207,7 @@ def main():
 
             frame = raw_frame.copy()
             mode = ZOOM_MODES[mode_index]
-            zoom_value = max(100, cv2.getTrackbarPos("Zoom", window))
+            zoom_value = max(100, cv2.getTrackbarPos("Zoom", controls_window))
             frame_size = (frame.shape[1], frame.shape[0])
             # Snapshot of the frame as zoomed/warped, before any overlay is
             # drawn on it. Clicks and candidate extraction operate on this, so
@@ -222,7 +225,7 @@ def main():
                     frame = cv2.remap(frame, map_x, map_y, interpolation=cv2.INTER_LINEAR)
                     candidate_frame = frame.copy()
                 elif mode == "linear":
-                    inner_ratio_value = cv2.getTrackbarPos("Inner Ratio", window)
+                    inner_ratio_value = cv2.getTrackbarPos("Inner Ratio", controls_window)
                     inner_ratio = inner_ratio_value / 100.0
                     if (
                         rect_cache["zoom_value"] != zoom_value
@@ -273,7 +276,7 @@ def main():
             if seekable:
                 pos = max(0, int(cap.get(cv2.CAP_PROP_POS_FRAMES)) - 1)
                 last_synced_pos[0] = pos
-                cv2.setTrackbarPos("Position", window, pos)
+                cv2.setTrackbarPos("Position", controls_window, pos)
 
             key = cv2.waitKey(delay_ms) & 0xFF
             if key == ord("q"):
@@ -283,15 +286,15 @@ def main():
             if key == ord(" "):
                 paused = not paused
 
-            min_var = cv2.getTrackbarPos("Color Var Min", window)
-            max_var = cv2.getTrackbarPos("Color Var Max (top=off)", window)
+            min_var = cv2.getTrackbarPos("Color Var Min", controls_window)
+            max_var = cv2.getTrackbarPos("Color Var Max (top=off)", controls_window)
             if max_var >= color_var_slider_max:
                 max_var = None
             # Moving a slider re-runs the last search so the effect is visible
             # right away.
-            dist_weight = cv2.getTrackbarPos("Click Dist Weight", window) / 100.0
-            point_reach = cv2.getTrackbarPos("Point Reach", window)
-            adaptive = cv2.getTrackbarPos("Adaptive Points", window) / 100.0
+            dist_weight = cv2.getTrackbarPos("Click Dist Weight", controls_window) / 100.0
+            point_reach = cv2.getTrackbarPos("Point Reach", controls_window)
+            adaptive = cv2.getTrackbarPos("Adaptive Points", controls_window) / 100.0
             if (min_var, max_var, dist_weight, point_reach, adaptive) != last_color_range:
                 last_color_range = (min_var, max_var, dist_weight, point_reach, adaptive)
                 if last_click_pos is not None and click_state["pos"] is None:
